@@ -10,10 +10,12 @@ services:
       - DATABASE_URL=sqlite+aiosqlite:///./data/mail_agg.db
       # 时区
       - TZ=Asia/Shanghai
-      # 加密密钥与登录配置（请在部署前改成自己的强随机值）
+      # 加密密钥与登录配置（首次部署留空，会自动生成，迁移时务必一起备份）
       - ENCRYPTION_KEY=
+      # 管理员账号密码
       - ADMIN_USERNAME=
       - ADMIN_PASSWORD=
+      # JWT 签名密钥（随机写一串数字+字母，最好长点）
       - JWT_SECRET=
       # 可选：API Token
       - API_TOKEN=
