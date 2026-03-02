@@ -177,8 +177,3 @@ mail-tool/
   - 备份 Docker 卷 `mail-tool-data`（数据库）。
   - 备份 `.env` 或你在部署环境里设置的关键环境变量（尤其是 `ENCRYPTION_KEY`、`JWT_SECRET`）。
 
-![image](https://i.111666.best/image/d3YRLBKex3KFZusYg2Xc8R.png)
-![image](https://i.111666.best/image/L2qiYf5HohSgscVWlDB0eC.png)
-![image](https://i.111666.best/image/OOkbThv9xxqoBETcrG01A0.png)
-![image](https://i.111666.best/image/wlcqPgRcogq36bloDlG7BJ.png)
-![image](https://i.111666.best/image/bKXSibSkwIy6nPmN4gleb2.png)
