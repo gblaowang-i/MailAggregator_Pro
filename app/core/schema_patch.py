@@ -91,3 +91,15 @@ async def ensure_sqlite_columns(engine: AsyncEngine) -> None:
             )
         """))
 
+        # Performance indexes for email listing, filtering, stats, and cleanup
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_emails_received_at ON emails (received_at)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_emails_account_received ON emails (account_id, received_at)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_emails_is_read ON emails (is_read)")
+        )
+
+

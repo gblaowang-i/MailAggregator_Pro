@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import timezone
+from email.utils import parseaddr
 from typing import Any, Optional
 
 import httpx
@@ -15,10 +17,12 @@ def _get_record_field(record: EmailRecord, field: str) -> str:
         raw = record.sender or ""
     elif field == "domain":
         s = record.sender or ""
-        if "@" in s:
-            raw = s.split("@")[-1].strip()
+        _, addr = parseaddr(s)
+        target = addr or s
+        if "@" in target:
+            raw = target.split("@")[-1].strip().strip(">")
         else:
-            raw = s
+            raw = target.strip()
     elif field == "subject":
         raw = record.subject or ""
     elif field == "body":
@@ -113,7 +117,37 @@ def _escape_html(text: str) -> str:
     )
 
 
-def _build_preview(preview_source: str, max_lines: int = 8, max_len: int = 80) -> str:
+def _escape_html_truncated(raw: str, max_escaped_len: int) -> str:
+    """
+    HTML-escape `raw` while guaranteeing the escaped result does not exceed
+    `max_escaped_len` characters and never splits an HTML entity like `&amp;`.
+    """
+    if max_escaped_len <= 0:
+        return ""
+    escaped_full = _escape_html(raw)
+    if len(escaped_full) <= max_escaped_len:
+        return escaped_full
+
+    budget = max_escaped_len - 1  # reserve 1 char for ellipsis
+    out: list[str] = []
+    cur_len = 0
+    for ch in raw:
+        if ch == "&":
+            part = "&amp;"
+        elif ch == "<":
+            part = "&lt;"
+        elif ch == ">":
+            part = "&gt;"
+        else:
+            part = ch
+        if cur_len + len(part) > budget:
+            break
+        out.append(part)
+        cur_len += len(part)
+    return "".join(out) + "…"
+
+
+def _build_preview(preview_source: str, max_lines: int = 8, max_len: int = 80, max_escaped_len: int = 3500) -> str:
     preview_lines: list[str] = []
     for ln in preview_source.splitlines():
         ln = ln.strip()
@@ -124,7 +158,9 @@ def _build_preview(preview_source: str, max_lines: int = 8, max_len: int = 80) -
         preview_lines.append(ln)
         if len(preview_lines) >= max_lines:
             break
-    return _escape_html("\n".join(preview_lines)) if preview_lines else ""
+    if not preview_lines:
+        return ""
+    return _escape_html_truncated("\n".join(preview_lines), max_escaped_len)
 
 
 async def send_email_notification(
@@ -134,16 +170,16 @@ async def send_email_notification(
 ) -> None:
     """
     Push a formatted email notification to Telegram.
-    template: "full" (long preview) | "short" (fewer lines) | "title_only" (no body).
+    template: "full_email" | "full" (long preview) | "short" (fewer lines) | "title_only" (no body).
     """
     template = template or getattr(account, "push_template", "short") or "short"
     subject_raw = record.subject or "(无主题)"
     sender_raw = record.sender or ""
     account_email_raw = account.email or ""
 
-    subject = _escape_html(subject_raw)
-    sender = _escape_html(sender_raw)
-    account_email = _escape_html(account_email_raw)
+    subject = _escape_html_truncated(subject_raw, 300)
+    sender = _escape_html_truncated(sender_raw, 200)
+    account_email = _escape_html_truncated(account_email_raw, 200)
 
     lines: list[str] = [
         f"📬 <b>{subject}</b>",
@@ -151,27 +187,33 @@ async def send_email_notification(
         f"账户: <code>{account_email}</code>",
     ]
     if record.received_at:
-        lines.append(f"时间: {record.received_at:%Y-%m-%d %H:%M}")
+        dt = record.received_at
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc).astimezone()
+        else:
+            dt = dt.astimezone()
+        lines.append(f"时间: {dt:%Y-%m-%d %H:%M}")
 
+    header_text = "\n".join(lines)
     if template != "title_only":
         preview_source = (record.body_text or record.content_summary or "").strip()
         if preview_source:
+            label = "正文：" if template == "full_email" else "内容预览："
+            # Reserve exact budget so total message stays <= 4096 without cutting HTML tags/entities
+            overhead = len(header_text) + 2 + len(label) + 1
+            remaining_budget = max(0, 4096 - overhead)
             if template == "full_email":
-                # 推送完整邮件正文，受 Telegram 单条 4096 字符限制
-                preview = _escape_html(preview_source)
-                if len(preview) > 3800:
-                    preview = preview[:3800] + "…"
+                preview = _escape_html_truncated(preview_source, min(3800, remaining_budget))
             elif template == "full":
-                preview = _build_preview(preview_source, max_lines=12, max_len=80)
+                preview = _build_preview(preview_source, max_lines=12, max_len=80, max_escaped_len=remaining_budget)
             else:
-                preview = _build_preview(preview_source, max_lines=4, max_len=60)
+                preview = _build_preview(preview_source, max_lines=4, max_len=60, max_escaped_len=remaining_budget)
             if preview:
                 lines.append("")
-                lines.append("内容预览：" if template != "full_email" else "正文：")
+                lines.append(label)
                 lines.append(preview)
 
     text = "\n".join(lines)
-    if len(text) > 4096:
-        text = text[:4092] + "…"
     await send_telegram_message(text)
+
 

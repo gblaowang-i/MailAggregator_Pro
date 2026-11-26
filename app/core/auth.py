@@ -1,4 +1,8 @@
 from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
+import os
+import secrets
 from typing import Optional
 
 import jwt
@@ -8,6 +12,7 @@ from app.core.config import get_settings
 
 JWT_ALG = "HS256"
 JWT_EXP_HOURS = 24 * 7  # 7 days
+_EPHEMERAL_FALLBACK_SECRET = secrets.token_hex(32)
 
 
 def _jwt_secret() -> str:
@@ -16,7 +21,11 @@ def _jwt_secret() -> str:
         return s.jwt_secret.strip()
     if s.api_token and s.api_token.strip():
         return s.api_token.strip()
-    return "mail-tool-jwt-default-secret"
+    # Derive a stable per-instance secret from ENCRYPTION_KEY instead of a hardcoded public string.
+    enc_key = (os.environ.get("ENCRYPTION_KEY") or s.encryption_key or "").strip()
+    if enc_key:
+        return hashlib.sha256(f"mail-tool-jwt:{enc_key}".encode("utf-8")).hexdigest()
+    return _EPHEMERAL_FALLBACK_SECRET
 
 
 def create_access_token(username: str) -> str:
@@ -47,6 +56,12 @@ def login_required() -> bool:
     return s.admin_password is not None and bool(str(s.admin_password).strip())
 
 
+def api_token_configured() -> bool:
+    """True if a static API_TOKEN is configured."""
+    s = get_settings()
+    return bool((s.api_token or "").strip())
+
+
 async def verify_api_token(
     authorization: Optional[str] = Header(default=None),
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
@@ -72,11 +87,12 @@ async def verify_api_token(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    if static_token and provided == static_token:
+    if static_token and hmac.compare_digest(provided, static_token):
         return
 
     username = decode_jwt(provided)
-    if username and username == (settings.admin_username or "").strip():
+    expected_user = (settings.admin_username or "").strip()
+    if username and expected_user and hmac.compare_digest(username, expected_user):
         return
 
     raise HTTPException(
@@ -84,3 +100,4 @@ async def verify_api_token(
         detail="认证失败或已过期，请重新登录",
         headers={"WWW-Authenticate": "Bearer"},
     )
+

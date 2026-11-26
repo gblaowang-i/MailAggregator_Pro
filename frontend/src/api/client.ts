@@ -5,7 +5,7 @@ export const AUTH_UNAUTHORIZED_EVENT = "auth:unauthorized";
 
 export const apiClient = axios.create({
   baseURL: "/api",
-  timeout: 10000
+  timeout: 30000
 });
 
 apiClient.interceptors.request.use((config) => {
@@ -43,6 +43,50 @@ export function logout(): void {
   window.dispatchEvent(new CustomEvent(AUTH_UNAUTHORIZED_EVENT));
 }
 
+/**
+ * Parse backend ISO datetime string safely as UTC when no timezone offset is present.
+ */
+export function parseUtcDate(value?: string | null): Date | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const hasTz = /[zZ]$|[+-]\d{2}:?\d{2}$/.test(trimmed);
+  const normalized = hasTz ? trimmed : `${trimmed}Z`;
+  const d = new Date(normalized);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+export function formatLocalDateTime(value?: string | null): string {
+  const d = parseUtcDate(value);
+  return d ? d.toLocaleString() : "-";
+}
+
+/** Extract a human-readable detail message from an Axios/FastAPI error response. */
+export function extractApiError(err: unknown, fallback: string): string {
+  if (axios.isAxiosError(err)) {
+    const detail = (err.response?.data as { detail?: unknown } | undefined)?.detail;
+    if (typeof detail === "string" && detail.trim()) {
+      return detail;
+    }
+    if (Array.isArray(detail) && detail.length > 0) {
+      const first = detail[0] as { msg?: string };
+      if (typeof first?.msg === "string" && first.msg.trim()) {
+        return first.msg;
+      }
+    }
+    if (err.code === "ECONNABORTED") {
+      return `${fallback}（请求超时）`;
+    }
+  }
+  return fallback;
+}
+
+export interface AuthConfig {
+  login_required: boolean;
+  api_token_required: boolean;
+  reset_available: boolean;
+}
+
 export interface EmailAccount {
   id: number;
   email: string;
@@ -52,7 +96,7 @@ export interface EmailAccount {
   is_active: boolean;
   sort_order?: number;
   telegram_push_enabled?: boolean;
-  push_template?: string; // full | short | title_only
+  push_template?: string; // full_email | full | short | title_only
   poll_interval_seconds?: number | null;
 }
 

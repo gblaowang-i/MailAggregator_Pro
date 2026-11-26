@@ -112,15 +112,29 @@ def get_settings() -> Settings:
     for k, v in overrides.items():
         if k not in d:
             continue
-        if k in {"poll_interval_seconds", "retention_keep_days", "retention_keep_per_account"}:
+        raw = v.strip() if isinstance(v, str) else v
+        if k == "poll_interval_seconds":
+            if raw in (None, ""):
+                # 留空时回退到 .env / 默认值
+                continue
             try:
-                if not v:
-                    d[k] = d.get(k)
-                else:
-                    d[k] = int(v)
-            except ValueError:
-                d[k] = d.get(k)
+                parsed = int(raw)
+                if parsed >= 5:
+                    d[k] = parsed
+            except (TypeError, ValueError):
+                continue
+        elif k in {"retention_keep_days", "retention_keep_per_account"}:
+            if raw in (None, ""):
+                # 在界面清空保留策略时应置为 None，而不是回退到 .env 旧值
+                d[k] = None
+                continue
+            try:
+                parsed = int(raw)
+                d[k] = parsed if parsed >= 1 else None
+            except (TypeError, ValueError):
+                d[k] = None
         else:
-            d[k] = v if v and str(v).strip() else None
+            d[k] = str(raw) if raw not in (None, "") else None
     return Settings(**d)
+
 

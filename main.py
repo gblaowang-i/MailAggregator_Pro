@@ -1,7 +1,7 @@
 import asyncio
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -39,6 +39,9 @@ def create_app() -> FastAPI:
 
             @app.get("/{full_path:path}")
             def serve_spa(full_path: str) -> FileResponse:
+                # 未知的 /api/* 请求直接返回 404，而不是回退到 index.html
+                if full_path == "api" or full_path.startswith("api/"):
+                    raise HTTPException(status_code=404, detail="Not Found")
                 # 禁止绝对路径与路径穿越，防止扫描器请求 //etc/shadow、//proc/self/xxx 等触发读系统文件导致 PermissionError / 轮询异常
                 if not full_path or full_path.startswith("/") or ".." in full_path:
                     return FileResponse(str(index_html))
@@ -71,8 +74,9 @@ def create_app() -> FastAPI:
             task.cancel()
             try:
                 await task
-            except Exception:
+            except (asyncio.CancelledError, Exception):
                 pass
+        await engine.dispose()
 
     return app
 

@@ -6,7 +6,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import Select, case, delete, func, select, text, union_all
+from sqlalchemy import Select, case, delete, func, select, text
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +14,7 @@ from app.core.auth import verify_api_token
 from app.core.config import get_settings
 from app.core.database import engine, get_db
 from app.models.email import EmailAccount, EmailRecord
+from app.schemas.accounts import encode_utc_datetime
 
 router = APIRouter(
     prefix="/stats",
@@ -21,7 +22,17 @@ router = APIRouter(
     dependencies=[Depends(verify_api_token)],
 )
 
-ARCHIVE_DIR = Path("./archives")
+LEGACY_ARCHIVE_DIR = Path("./archives")
+DELETE_CHUNK_SIZE = 500
+
+
+def _get_archive_dir() -> Path:
+    """Store archives in <db_dir>/archives when using SQLite (persistent volume in Docker), else ./archives."""
+    db_info = _get_db_file_info()
+    db_path_str = db_info.get("path")
+    if db_path_str:
+        return Path(db_path_str).parent / "archives"
+    return LEGACY_ARCHIVE_DIR
 
 
 def _as_date_str(d: date) -> str:
@@ -32,17 +43,19 @@ def _monday_of(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
 
-async def _sqlite_vacuum_if_possible() -> None:
+async def _sqlite_vacuum_if_possible() -> bool:
     try:
         if engine.dialect.name != "sqlite":
-            return
-        # VACUUM cannot run inside a transaction; use a plain connection.
+            return False
+        # VACUUM cannot run inside a transaction; use AUTOCOMMIT isolation level.
         async with engine.connect() as conn:
-            await conn.execute(text("VACUUM"))
-            await conn.commit()
-    except Exception:
+            autocommit_conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+            await autocommit_conn.execute(text("VACUUM"))
+        return True
+    except Exception as exc:
         # Best-effort only; cleanup should not fail due to VACUUM.
-        return
+        print(f"[stats] sqlite VACUUM skipped/failed: {exc}")
+        return False
 
 
 def _get_db_file_info() -> dict[str, Any]:
@@ -56,7 +69,7 @@ def _get_db_file_info() -> dict[str, Any]:
         return {"path": None, "size_bytes": None}
 
     db_path = url.database
-    if not db_path:
+    if not db_path or db_path == ":memory:":
         return {"path": None, "size_bytes": None}
 
     p = Path(db_path)
@@ -154,8 +167,8 @@ async def get_overview(
             "emails": int(total_emails or 0),
             "unread": int(unread_emails or 0),
             "accounts": int(total_accounts or 0),
-            "oldest_received_at": oldest.isoformat() if oldest else None,
-            "newest_received_at": newest.isoformat() if newest else None,
+            "oldest_received_at": encode_utc_datetime(oldest) if oldest else None,
+            "newest_received_at": encode_utc_datetime(newest) if newest else None,
         },
         "trend": {"daily": daily, "weekly": weekly},
         "by_account": by_account,
@@ -190,7 +203,7 @@ async def cleanup_emails(
     if keep_days is None and keep_per_account is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Please provide keep_days or keep_per_account (or set retention defaults in settings).",
+            detail="请填写保留天数或每账号保留封数（或先在设置中配置默认策略）。",
         )
 
     now = datetime.utcnow()
@@ -198,39 +211,10 @@ async def cleanup_emails(
     if keep_days is not None:
         cutoff_dt = datetime.combine((now.date() - timedelta(days=keep_days)), datetime.min.time())
 
-    # Candidate queries
-    candidates = []
+    # Compute breakdown consistently with execution order (by_days first, then overflow on remaining rows)
+    by_days_count = 0
     if cutoff_dt is not None:
-        candidates.append(select(EmailRecord.id.label("id")).where(EmailRecord.received_at < cutoff_dt))
-
-    overflow_stmt = None
-    if keep_per_account is not None:
-        ranked = (
-            select(
-                EmailRecord.id.label("id"),
-                func.row_number()
-                .over(
-                    partition_by=EmailRecord.account_id,
-                    order_by=EmailRecord.received_at.desc(),
-                )
-                .label("rn"),
-            )
-        ).subquery()
-        overflow_stmt = select(ranked.c.id.label("id")).where(ranked.c.rn > keep_per_account)
-        candidates.append(overflow_stmt)
-
-    if len(candidates) == 1:
-        union_ids = candidates[0].subquery()
-        would_delete = (await db.execute(select(func.count(union_ids.c.id)))).scalar_one()
-    else:
-        u = union_all(*candidates).subquery()
-        would_delete = (await db.execute(select(func.count(func.distinct(u.c.id))))).scalar_one()
-
-    would_delete = int(would_delete or 0)
-
-    details = {"by_days": 0, "by_overflow": 0}
-    if cutoff_dt is not None:
-        details["by_days"] = int(
+        by_days_count = int(
             (
                 await db.execute(
                     select(func.count(EmailRecord.id)).where(EmailRecord.received_at < cutoff_dt)
@@ -238,20 +222,40 @@ async def cleanup_emails(
             ).scalar_one()
             or 0
         )
-    if overflow_stmt is not None:
-        sub = overflow_stmt.subquery()
-        details["by_overflow"] = int(
-            (await db.execute(select(func.count(sub.c.id)))).scalar_one() or 0
+
+    by_overflow_count = 0
+    if keep_per_account is not None:
+        remaining_q = select(
+            EmailRecord.id.label("id"),
+            func.row_number()
+            .over(
+                partition_by=EmailRecord.account_id,
+                order_by=(EmailRecord.received_at.desc(), EmailRecord.id.desc()),
+            )
+            .label("rn"),
         )
+        if cutoff_dt is not None:
+            remaining_q = remaining_q.where(EmailRecord.received_at >= cutoff_dt)
+        ranked = remaining_q.subquery()
+        by_overflow_count = int(
+            (
+                await db.execute(
+                    select(func.count(ranked.c.id)).where(ranked.c.rn > keep_per_account)
+                )
+            ).scalar_one()
+            or 0
+        )
+
+    would_delete = by_days_count + by_overflow_count
 
     if body.dry_run:
         return {
             "dry_run": True,
             "keep_days": keep_days,
             "keep_per_account": keep_per_account,
-            "cutoff": cutoff_dt.isoformat() if cutoff_dt else None,
+            "cutoff": encode_utc_datetime(cutoff_dt) if cutoff_dt else None,
             "would_delete": would_delete,
-            "details": details,
+            "details": {"by_days": by_days_count, "by_overflow": by_overflow_count},
         }
 
     deleted_days = 0
@@ -266,7 +270,7 @@ async def cleanup_emails(
                 func.row_number()
                 .over(
                     partition_by=EmailRecord.account_id,
-                    order_by=EmailRecord.received_at.desc(),
+                    order_by=(EmailRecord.received_at.desc(), EmailRecord.id.desc()),
                 )
                 .label("rn"),
             )
@@ -276,17 +280,18 @@ async def cleanup_emails(
         deleted_overflow = int(res2.rowcount or 0)
 
     await db.commit()
+    vacuumed = False
     if body.vacuum:
-        await _sqlite_vacuum_if_possible()
+        vacuumed = await _sqlite_vacuum_if_possible()
 
     return {
         "dry_run": False,
         "keep_days": keep_days,
         "keep_per_account": keep_per_account,
-        "cutoff": cutoff_dt.isoformat() if cutoff_dt else None,
+        "cutoff": encode_utc_datetime(cutoff_dt) if cutoff_dt else None,
         "deleted": int(deleted_days + deleted_overflow),
         "details": {"by_days": deleted_days, "by_overflow": deleted_overflow},
-        "vacuumed": bool(body.vacuum and engine.dialect.name == "sqlite"),
+        "vacuumed": vacuumed,
     }
 
 
@@ -326,10 +331,11 @@ async def archive_emails(
     if not rows:
         return {"count": 0, "file_name": None, "download_url": None}
 
-    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    archive_dir = _get_archive_dir()
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
     file_name = f"emails_archive_{ts}.jsonl"
-    file_path = (ARCHIVE_DIR / file_name).resolve()
+    file_path = (archive_dir / file_name).resolve()
 
     ids: list[int] = []
     with file_path.open("w", encoding="utf-8") as f:
@@ -337,7 +343,7 @@ async def archive_emails(
             ids.append(int(r["id"]))
             payload = dict(r)
             if payload.get("received_at") is not None:
-                payload["received_at"] = payload["received_at"].isoformat()
+                payload["received_at"] = encode_utc_datetime(payload["received_at"])
             # Normalize labels to list for convenience
             try:
                 payload["labels"] = json.loads(payload.get("labels") or "[]")
@@ -347,8 +353,11 @@ async def archive_emails(
 
     deleted = 0
     if body.delete_after:
-        res = await db.execute(delete(EmailRecord).where(EmailRecord.id.in_(ids)))
-        deleted = int(res.rowcount or 0)
+        # Chunk deletions to stay safely below SQLite's max SQL variable limit
+        for i in range(0, len(ids), DELETE_CHUNK_SIZE):
+            chunk = ids[i : i + DELETE_CHUNK_SIZE]
+            res = await db.execute(delete(EmailRecord).where(EmailRecord.id.in_(chunk)))
+            deleted += int(res.rowcount or 0)
         await db.commit()
 
     return {
@@ -356,20 +365,26 @@ async def archive_emails(
         "deleted": deleted,
         "file_name": file_name,
         "download_url": f"/api/stats/archive/{file_name}",
-        "cutoff": cutoff.isoformat(),
+        "cutoff": encode_utc_datetime(cutoff),
     }
 
 
 @router.get("/archive/{file_name}")
 async def download_archive(file_name: str) -> FileResponse:
-    if "/" in file_name or "\\" in file_name or ".." in file_name:
+    if not file_name or "/" in file_name or "\\" in file_name or ".." in file_name:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid file name")
-    file_path = (ARCHIVE_DIR / file_name).resolve()
-    if not file_path.exists() or not file_path.is_file():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
-    return FileResponse(
-        path=str(file_path),
-        media_type="application/jsonl",
-        filename=file_name,
-    )
+
+    # Check primary archive dir first, then legacy ./archives for backward compatibility
+    for base_dir in (_get_archive_dir(), LEGACY_ARCHIVE_DIR):
+        base_resolved = base_dir.resolve()
+        candidate = (base_dir / file_name).resolve()
+        if candidate.is_relative_to(base_resolved) and candidate.is_file():
+            return FileResponse(
+                path=str(candidate),
+                media_type="application/jsonl",
+                filename=file_name,
+            )
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
 

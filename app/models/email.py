@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
@@ -18,7 +18,7 @@ class EmailAccount(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
     telegram_push_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    push_template: Mapped[str] = mapped_column(String, default="short")  # full | short | title_only
+    push_template: Mapped[str] = mapped_column(String, default="short")  # full_email | full | short | title_only
     poll_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=True, default=None)
 
     emails: Mapped[list["EmailRecord"]] = relationship(
@@ -31,6 +31,9 @@ class EmailAccount(Base):
 
 class EmailRecord(Base):
     __tablename__ = "emails"
+    __table_args__ = (
+        Index("ix_emails_account_received", "account_id", "received_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     message_id: Mapped[str] = mapped_column(String, unique=True, index=True)
@@ -42,10 +45,11 @@ class EmailRecord(Base):
     content_summary: Mapped[str] = mapped_column(Text)
     body_text: Mapped[str] = mapped_column(Text, nullable=True)
     body_html: Mapped[str] = mapped_column(Text, nullable=True)
-    received_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    received_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     created_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
-    is_read: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     labels: Mapped[str] = mapped_column(Text, nullable=True, default="[]")
 
     account: Mapped[EmailAccount] = relationship(back_populates="emails")
+
 

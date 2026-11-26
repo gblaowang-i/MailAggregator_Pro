@@ -715,9 +715,29 @@ html[data-theme="light"] .provider-custom {
   color: var(--text);
 }
 
-.secondary-btn:hover {
+.secondary-btn:hover:not(:disabled) {
   background: rgba(55, 55, 55, 0.95);
   border-color: rgba(255, 255, 255, 0.18);
+}
+
+.secondary-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.secondary-btn.danger {
+  border-color: rgba(248, 113, 113, 0.4);
+  color: #fecaca;
+}
+
+html[data-theme="light"] .secondary-btn:hover:not(:disabled) {
+  background: rgba(226, 232, 240, 0.95);
+  border-color: rgba(15, 23, 42, 0.25);
+}
+
+html[data-theme="light"] .secondary-btn.danger {
+  color: #b91c1c;
+  border-color: rgba(185, 28, 28, 0.35);
 }
 
 .primary-btn:focus-visible,
@@ -736,6 +756,23 @@ html[data-theme="light"] .provider-custom {
   font-size: 0.8rem;
 }
 
+html[data-theme="light"] .error-text {
+  color: #b91c1c;
+}
+
+.success-text {
+  color: #4ade80;
+  font-size: 0.8rem;
+}
+
+html[data-theme="light"] .success-text {
+  color: #15803d;
+}
+
+html[data-theme="light"] tr.email-unread {
+  background: rgba(59, 130, 246, 0.06);
+}
+
 .truncate {
   max-width: 360px;
   white-space: nowrap;
@@ -751,15 +788,18 @@ html[data-theme="light"] .provider-custom {
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 1rem;
   z-index: 40;
 }
 
 .modal {
-  width: 420px;
-  max-width: 90vw;
+  width: 460px;
+  max-width: 92vw;
+  max-height: 90vh;
+  overflow-y: auto;
   background: var(--modal-bg);
   border-radius: 1rem;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--card-border);
   box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
   padding: 1.1rem 1.25rem 1rem;
 }
@@ -787,7 +827,7 @@ html[data-theme="light"] .provider-custom {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 0.25rem 0.75rem;
-  color: #9ca3af;
+  color: var(--muted);
   font-size: 0.75rem;
 }
 
@@ -798,9 +838,9 @@ html[data-theme="light"] .provider-custom {
 }
 
 .icon-btn {
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(38, 38, 38, 0.95);
-  color: #e5e7eb;
+  border: 1px solid var(--secondary-border);
+  background: var(--secondary-bg);
+  color: var(--text);
   width: 32px;
   height: 32px;
   border-radius: 999px;
@@ -810,11 +850,11 @@ html[data-theme="light"] .provider-custom {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
 }
 
 .icon-btn:hover {
-  background: rgba(255, 255, 255, 0.1);
-  border-color: rgba(255, 255, 255, 0.2);
+  background: var(--row-hover);
 }
 
 .modal-body {
@@ -979,7 +1019,7 @@ html[data-theme="light"] .provider-custom {
   min-width: 0;
   padding: 0.6rem 0.75rem;
   border-radius: 12px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--card-border);
   background: var(--card-bg);
 }
 .stats-kpi-item.stats-kpi-storage {
@@ -1014,9 +1054,26 @@ html[data-theme="light"] .provider-custom {
   transition: background 0.15s, border-color 0.15s;
 }
 
-.small-btn:hover {
+.small-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.small-btn:hover:not(:disabled) {
   background: rgba(55, 55, 55, 0.95);
   border-color: rgba(255, 255, 255, 0.18);
+}
+
+.small-btn.active-tab {
+  background: linear-gradient(to right, #374151, #4b5563);
+  border-color: rgba(255, 255, 255, 0.25);
+  color: #ffffff;
+}
+
+html[data-theme="light"] .small-btn.active-tab {
+  background: #2563eb;
+  border-color: #1d4ed8;
+  color: #ffffff;
 }
 
 .small-btn:focus-visible {
@@ -1030,7 +1087,7 @@ html[data-theme="light"] .provider-custom {
   background: rgba(127, 29, 29, 0.25);
 }
 
-.small-btn.danger:hover {
+.small-btn.danger:hover:not(:disabled) {
   background: rgba(185, 28, 28, 0.4);
   border-color: rgba(248, 113, 113, 0.7);
 }
@@ -1049,8 +1106,16 @@ html[data-theme="light"] .provider-custom {
   text-decoration: underline;
 }
 
+html[data-theme="light"] .link-btn:hover {
+  color: #1d4ed8;
+}
+
 .error-row td {
   background: rgba(2, 6, 23, 0.6);
+}
+
+html[data-theme="light"] .error-row td {
+  background: rgba(254, 242, 242, 0.85);
 }
 
 .error-box {
@@ -1062,6 +1127,13 @@ html[data-theme="light"] .provider-custom {
   font-size: 0.78rem;
   line-height: 1.35;
   white-space: pre-wrap;
+  word-break: break-word;
+}
+
+html[data-theme="light"] .error-box {
+  border-color: rgba(185, 28, 28, 0.3);
+  background: rgba(254, 226, 226, 0.7);
+  color: #991b1b;
 }
 
 .email-pre {
@@ -1074,9 +1146,19 @@ html[data-theme="light"] .provider-custom {
   color: var(--text);
   padding: 0.75rem;
   font-size: 0.8rem;
-  line-height: 1.35;
+  line-height: 1.4;
   white-space: pre-wrap;
+  word-break: break-word;
 }
+
+.email-html-frame {
+  width: 100%;
+  height: 55vh;
+  border-radius: 0.75rem;
+  border: 1px solid var(--card-border);
+  background: #ffffff;
+}
+
 @media (max-width: 768px) {
   .app-main {
     padding: 1rem;
@@ -1091,13 +1173,9 @@ html[data-theme="light"] .provider-custom {
     align-items: flex-start;
   }
 
-  .data-table th:nth-child(4),
-  .data-table td:nth-child(4) {
-    display: none;
-  }
-
   .modal-meta {
     grid-template-columns: 1fr;
   }
 }
+
 

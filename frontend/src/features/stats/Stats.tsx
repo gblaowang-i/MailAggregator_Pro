@@ -1,6 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import axios from "axios";
-import { apiClient } from "../../api/client";
+import { apiClient, extractApiError } from "../../api/client";
 
 type Overview = {
   totals: {
@@ -58,11 +57,12 @@ export const Stats = () => {
 
   const [keepDays, setKeepDays] = useState<string>("");
   const [keepPerAcc, setKeepPerAcc] = useState<string>("");
-  const [dryRun, setDryRun] = useState(true);
   const [vacuum, setVacuum] = useState(false);
+  const [cleaning, setCleaning] = useState(false);
   const [cleanupRes, setCleanupRes] = useState<CleanupResult | null>(null);
   const [cleanupErr, setCleanupErr] = useState<string | null>(null);
   const [savingDefaults, setSavingDefaults] = useState(false);
+  const [defaultsSavedMsg, setDefaultsSavedMsg] = useState<string | null>(null);
 
   const [archiveDays, setArchiveDays] = useState<string>("30");
   const [archiveDelete, setArchiveDelete] = useState(false);
@@ -123,6 +123,14 @@ export const Stats = () => {
   const submitCleanup = async (forceDryRun: boolean) => {
     setCleanupErr(null);
     setCleanupRes(null);
+    setDefaultsSavedMsg(null);
+
+    if (!forceDryRun) {
+      const ok = window.confirm("确认执行清理？此操作会永久删除符合条件的邮件记录（建议先点击「预览清理」确认数量）。");
+      if (!ok) return;
+    }
+
+    setCleaning(true);
     try {
       const payload = {
         keep_days: parseOptInt(keepDays),
@@ -131,27 +139,34 @@ export const Stats = () => {
         dry_run: forceDryRun,
         vacuum: !forceDryRun && vacuum,
       };
-      const res = await apiClient.post<CleanupResult>("/stats/cleanup", payload);
+      const res = await apiClient.post<CleanupResult>("/stats/cleanup", payload, {
+        timeout: 120000,
+      });
       setCleanupRes(res.data);
-      await fetchAll();
-    } catch (err) {
-      if (axios.isAxiosError(err) && err.response) {
-        const detail = (err.response.data as any)?.detail;
-        setCleanupErr(typeof detail === "string" ? detail : "清理失败");
-      } else {
-        setCleanupErr("清理失败");
+      if (!forceDryRun) {
+        await fetchAll();
       }
+    } catch (err) {
+      setCleanupErr(extractApiError(err, "清理失败"));
+    } finally {
+      setCleaning(false);
     }
   };
 
   const saveDefaults = async (e: FormEvent) => {
     e.preventDefault();
     setSavingDefaults(true);
+    setCleanupErr(null);
+    setDefaultsSavedMsg(null);
     try {
       await apiClient.patch("/settings", {
         retention_keep_days: parseOptInt(keepDays),
         retention_keep_per_account: parseOptInt(keepPerAcc),
       });
+      setDefaultsSavedMsg("默认保留策略已保存");
+      window.setTimeout(() => setDefaultsSavedMsg(null), 3000);
+    } catch (err) {
+      setCleanupErr(extractApiError(err, "保存默认策略失败"));
     } finally {
       setSavingDefaults(false);
     }
@@ -160,22 +175,30 @@ export const Stats = () => {
   const doArchive = async () => {
     setArchiveErr(null);
     setArchiveRes(null);
+    const days = parseOptInt(archiveDays);
+    if (!days) {
+      setArchiveErr("请输入有效的归档天数");
+      return;
+    }
+    if (archiveDelete) {
+      const ok = window.confirm(`确认导出早于 ${days} 天的邮件并在导出后从数据库永久删除？`);
+      if (!ok) return;
+    }
     setArchiving(true);
     try {
-      const days = parseOptInt(archiveDays);
-      if (!days) {
-        setArchiveErr("请输入有效的归档天数");
-        return;
-      }
-      const res = await apiClient.post<ArchiveResult>("/stats/archive", {
-        older_than_days: days,
-        delete_after: archiveDelete,
-        limit: 0,
-      });
+      const res = await apiClient.post<ArchiveResult>(
+        "/stats/archive",
+        {
+          older_than_days: days,
+          delete_after: archiveDelete,
+          limit: 0,
+        },
+        { timeout: 120000 },
+      );
       setArchiveRes(res.data);
       await fetchAll();
-    } catch {
-      setArchiveErr("归档失败");
+    } catch (err) {
+      setArchiveErr(extractApiError(err, "归档失败"));
     } finally {
       setArchiving(false);
     }
@@ -187,6 +210,7 @@ export const Stats = () => {
     try {
       const res = await apiClient.get(`/stats/archive/${archiveRes.file_name}`, {
         responseType: "blob",
+        timeout: 120000,
       });
       const url = URL.createObjectURL(res.data as Blob);
       const a = document.createElement("a");
@@ -194,8 +218,8 @@ export const Stats = () => {
       a.download = archiveRes.file_name;
       a.click();
       URL.revokeObjectURL(url);
-    } catch {
-      setArchiveErr("下载归档文件失败，请重试");
+    } catch (err) {
+      setArchiveErr(extractApiError(err, "下载归档文件失败，请重试"));
     } finally {
       setArchiveDownloading(false);
     }
@@ -241,7 +265,7 @@ export const Stats = () => {
                 <div className="muted" style={{ fontSize: "0.75rem" }}>存储量</div>
                 <div style={{ fontSize: "0.9rem", fontWeight: 700 }}>{dbSizeText}</div>
                 {overview.db?.path && (
-                  <div className="muted" style={{ fontSize: "0.7rem", marginTop: "0.15rem" }}>
+                  <div className="muted" style={{ fontSize: "0.7rem", marginTop: "0.15rem", wordBreak: "break-all" }}>
                     {overview.db.path}
                   </div>
                 )}
@@ -298,6 +322,7 @@ export const Stats = () => {
 
           <section className="form-section">
             <h4 className="form-section-title">各账号邮件占比</h4>
+            <div className="table-scroll">
             <table className="data-table">
               <thead>
                 <tr>
@@ -320,6 +345,7 @@ export const Stats = () => {
                 ))}
               </tbody>
             </table>
+            </div>
           </section>
 
           <section className="form-section">
@@ -350,39 +376,38 @@ export const Stats = () => {
                 <label className="checkbox-inline" style={{ cursor: "pointer" }}>
                   <input
                     type="checkbox"
-                    checked={dryRun}
-                    onChange={(e) => setDryRun(e.target.checked)}
-                  />
-                  默认预览（dry-run）
-                </label>
-                <label className="checkbox-inline" style={{ cursor: "pointer" }}>
-                  <input
-                    type="checkbox"
                     checked={vacuum}
                     onChange={(e) => setVacuum(e.target.checked)}
                   />
-                  清理后 VACUUM（SQLite）
+                  清理后 VACUUM（回收 SQLite 磁盘空间）
                 </label>
               </div>
 
               <div className="table-actions" style={{ marginTop: "0.6rem" }}>
-                <button type="button" className="small-btn" onClick={() => submitCleanup(true)}>
-                  预览清理
+                <button
+                  type="button"
+                  className="small-btn"
+                  onClick={() => submitCleanup(true)}
+                  disabled={cleaning}
+                >
+                  {cleaning ? "计算中..." : "预览清理"}
                 </button>
                 <button
                   type="button"
                   className="small-btn danger"
                   onClick={() => submitCleanup(false)}
+                  disabled={cleaning}
                   title="会真正删除邮件记录（建议先预览）"
                 >
-                  执行清理
+                  {cleaning ? "清理中..." : "执行清理"}
                 </button>
-                <button type="submit" className="small-btn" disabled={savingDefaults}>
+                <button type="submit" className="small-btn" disabled={savingDefaults || cleaning}>
                   {savingDefaults ? "保存中..." : "保存为默认策略"}
                 </button>
               </div>
 
               {cleanupErr && <p className="error-text" style={{ marginTop: "0.4rem" }}>{cleanupErr}</p>}
+              {defaultsSavedMsg && <p className="success-text" style={{ marginTop: "0.4rem" }}>{defaultsSavedMsg}</p>}
               {cleanupRes && (
                 <div style={{ marginTop: "0.45rem" }}>
                   {cleanupRes.dry_run ? (
@@ -402,7 +427,7 @@ export const Stats = () => {
 
           <section className="form-section">
             <h4 className="form-section-title">历史归档（导出）</h4>
-            <label className="field-inline">
+            <label className="field-inline" style={{ flexWrap: "wrap" }}>
               <span>归档早于 N 天的邮件</span>
               <input
                 type="number"
@@ -455,4 +480,5 @@ export const Stats = () => {
     </section>
   );
 };
+
 

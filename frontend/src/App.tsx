@@ -6,7 +6,14 @@ import { RuleList } from "./features/rules/RuleList";
 import { Stats } from "./features/stats/Stats";
 import { Settings } from "./features/settings/Settings";
 import { Login } from "./features/auth/Login";
-import { getApiToken, logout, AUTH_UNAUTHORIZED_EVENT } from "./api/client";
+import {
+  AuthConfig,
+  apiClient,
+  getApiToken,
+  logout,
+  setApiToken,
+  AUTH_UNAUTHORIZED_EVENT
+} from "./api/client";
 
 type View = "accounts" | "emails" | "rules" | "settings";
 type Theme = "dark" | "light";
@@ -20,6 +27,11 @@ export const App = () => {
   const [pollInfo, setPollInfo] = useState<string>("");
   const [theme, setTheme] = useState<Theme>("dark");
   const [needLogin, setNeedLogin] = useState<boolean | null>(null);
+  const [authConfig, setAuthConfig] = useState<AuthConfig>({
+    login_required: false,
+    api_token_required: false,
+    reset_available: false
+  });
 
   useEffect(() => {
     const saved = (localStorage.getItem(THEME_KEY) as Theme | null) ?? "dark";
@@ -31,23 +43,52 @@ export const App = () => {
   useEffect(() => {
     const checkAuth = async () => {
       try {
-        const res = await axios.get<{ login_required?: boolean }>(AUTH_CONFIG_URL);
-        const loginRequired = !!res.data?.login_required;
-        if (loginRequired && !getApiToken()) {
+        const res = await axios.get<Partial<AuthConfig>>(AUTH_CONFIG_URL);
+        const cfg: AuthConfig = {
+          login_required: !!res.data?.login_required,
+          api_token_required: !!res.data?.api_token_required,
+          reset_available: !!res.data?.reset_available
+        };
+        setAuthConfig(cfg);
+        const needAuth = cfg.login_required || cfg.api_token_required;
+        if (!needAuth) {
+          setNeedLogin(false);
+          return;
+        }
+        const token = getApiToken();
+        if (!token) {
           setNeedLogin(true);
           return;
         }
+        // Verify stored token before rendering main views to avoid a 401 flash.
+        try {
+          await apiClient.get("/auth/me");
+          setNeedLogin(false);
+        } catch {
+          setApiToken(null);
+          setNeedLogin(true);
+        }
       } catch {
         setNeedLogin(false);
-        return;
       }
-      setNeedLogin(false);
     };
     checkAuth();
   }, []);
 
   useEffect(() => {
-    const onUnauthorized = () => setNeedLogin(true);
+    const onUnauthorized = () => {
+      axios
+        .get<Partial<AuthConfig>>(AUTH_CONFIG_URL)
+        .then((res) => {
+          setAuthConfig({
+            login_required: !!res.data?.login_required,
+            api_token_required: !!res.data?.api_token_required,
+            reset_available: !!res.data?.reset_available
+          });
+        })
+        .catch(() => {});
+      setNeedLogin(true);
+    };
     window.addEventListener(AUTH_UNAUTHORIZED_EVENT, onUnauthorized);
     return () => window.removeEventListener(AUTH_UNAUTHORIZED_EVENT, onUnauthorized);
   }, []);
@@ -85,7 +126,14 @@ export const App = () => {
   }, []);
 
   if (needLogin === true) {
-    return <Login onSuccess={() => setNeedLogin(false)} theme={theme} onToggleTheme={toggleTheme} />;
+    return (
+      <Login
+        onSuccess={() => setNeedLogin(false)}
+        theme={theme}
+        onToggleTheme={toggleTheme}
+        authConfig={authConfig}
+      />
+    );
   }
   if (needLogin === null) {
     return (
@@ -119,8 +167,8 @@ export const App = () => {
           <button
             className={view === "emails" ? "nav-btn active" : "nav-btn"}
             onClick={() => {
-              setView("emails");
               setSelectedAccountId(null);
+              setView("emails");
             }}
           >
             邮件列表
@@ -232,9 +280,13 @@ export const App = () => {
           <AccountList
             selectedAccountId={selectedAccountId}
             onSelectAccount={setSelectedAccountId}
+            onViewEmails={(id) => {
+              setSelectedAccountId(id);
+              setView("emails");
+            }}
           />
         )}
-        {view === "emails" && <EmailList accountId={null} />}
+        {view === "emails" && <EmailList accountId={selectedAccountId} />}
         {view === "rules" && <RuleList />}
         {view === "settings" && (
           <div style={{ display: "grid", gap: "0.9rem" }}>
@@ -246,4 +298,5 @@ export const App = () => {
     </div>
   );
 };
+
 

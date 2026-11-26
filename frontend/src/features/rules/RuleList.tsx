@@ -112,12 +112,19 @@ export const RuleList = () => {
     try {
       setSaving(true);
       setFormError(null);
+      const pendingLabel = newLabel.trim();
+      const labels = [...(form.add_labels || [])];
+      if (pendingLabel && !labels.includes(pendingLabel)) {
+        labels.push(pendingLabel);
+      }
+      const payload: MailRuleCreate = { ...form, add_labels: labels };
       if (modalMode === "create") {
-        await apiClient.post<MailRule>("/rules/", form);
+        await apiClient.post<MailRule>("/rules/", payload);
       } else if (editingId) {
-        await apiClient.patch(`/rules/${editingId}`, form);
+        await apiClient.patch(`/rules/${editingId}`, payload);
       }
       setShowModal(false);
+      setNewLabel("");
       await fetchRules();
     } catch (err: any) {
       const detail = err.response?.data?.detail;
@@ -128,7 +135,7 @@ export const RuleList = () => {
   };
 
   const deleteRule = async (id: number) => {
-    if (!window.confirm("确认删除这条规则？")) return;
+    if (!window.confirm("确认删除这条规则？（会同时清理仅由该规则添加的历史标签）")) return;
     try {
       await apiClient.delete(`/rules/${id}`);
       await fetchRules();
@@ -165,6 +172,7 @@ export const RuleList = () => {
       )}
 
       {!loading && !error && rules.length > 0 && (
+        <div className="table-scroll">
         <table className="data-table">
           <thead>
             <tr>
@@ -187,7 +195,7 @@ export const RuleList = () => {
                 <td className="truncate" style={{ maxWidth: 200 }}>
                   {[r.sender_pattern, r.subject_pattern, r.body_pattern]
                     .filter(Boolean)
-                    .join(" · ") || "-"}
+                    .join(" · ") || "全部邮件"}
                 </td>
                 <td>
                   {r.add_labels && r.add_labels.length > 0
@@ -218,11 +226,12 @@ export const RuleList = () => {
             ))}
           </tbody>
         </table>
+        </div>
       )}
 
       {showModal && (
-        <div className="modal-backdrop">
-          <div className="modal">
+        <div className="modal-backdrop" onClick={() => !saving && setShowModal(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
             <header className="modal-header">
               <h3>{modalMode === "create" ? "新建规则" : "编辑规则"}</h3>
             </header>

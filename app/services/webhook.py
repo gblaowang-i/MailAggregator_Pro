@@ -1,10 +1,11 @@
 import json
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 
 from app.core.config import get_settings
-from app.models.email import EmailAccount, EmailRecord
+from app.models.email import EmailRecord
+from app.schemas.accounts import encode_utc_datetime
 
 
 def _build_payload(record: EmailRecord, account_email: str) -> dict[str, Any]:
@@ -22,7 +23,7 @@ def _build_payload(record: EmailRecord, account_email: str) -> dict[str, Any]:
         "subject": record.subject or "",
         "sender": record.sender or "",
         "content_summary": (record.content_summary or "")[:500],
-        "received_at": record.received_at.isoformat() if record.received_at else None,
+        "received_at": encode_utc_datetime(record.received_at) if record.received_at else None,
         "is_read": bool(record.is_read),
         "labels": labels,
     }
@@ -41,10 +42,13 @@ async def send_webhook_for_email(
     payload = _build_payload(record, account_email)
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(
+            resp = await client.post(
                 url,
                 json=payload,
                 headers={"Content-Type": "application/json"},
             )
-    except Exception:
-        pass
+            if resp.status_code >= 400:
+                print(f"[webhook] non-2xx status={resp.status_code} url={url}")
+    except Exception as exc:
+        print(f"[webhook] send failed url={url}: {exc}")
+

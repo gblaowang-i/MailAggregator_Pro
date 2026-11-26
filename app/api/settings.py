@@ -132,6 +132,48 @@ class ImportPayload(BaseModel):
     accounts: Optional[List[AccountImport]] = None
 
 
+def _validate_settings_updates(updates: dict[str, Any]) -> None:
+    if "poll_interval_seconds" in updates and updates["poll_interval_seconds"] is not None:
+        if int(updates["poll_interval_seconds"]) < 5:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="全局轮询间隔不能小于 5 秒",
+            )
+    if "retention_keep_days" in updates and updates["retention_keep_days"] is not None:
+        if int(updates["retention_keep_days"]) < 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="保留天数不能小于 1 天",
+            )
+    if "retention_keep_per_account" in updates and updates["retention_keep_per_account"] is not None:
+        if int(updates["retention_keep_per_account"]) < 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="每账号保留封数不能小于 1",
+            )
+
+
+async def _persist_settings_updates(db: AsyncSession, updates: dict[str, Any]) -> None:
+    for key in list(updates.keys()):
+        if key not in EDITABLE_KEYS:
+            del updates[key]
+    _validate_settings_updates(updates)
+    for key, value in updates.items():
+        if key == "api_token" and isinstance(value, str) and value.strip() == "***":
+            # Prevent accidentally overwriting the real api_token with masked placeholder
+            continue
+        if key in {"poll_interval_seconds", "retention_keep_days", "retention_keep_per_account"}:
+            val = str(value) if value is not None else ""
+        else:
+            val = (value or "").strip()
+        await db.execute(
+            text(
+                "INSERT OR REPLACE INTO system_settings (key, value) VALUES (:k, :v)"
+            ),
+            {"k": key, "v": val},
+        )
+
+
 @router.post("/import")
 async def import_settings(
     body: ImportPayload,
@@ -140,41 +182,39 @@ async def import_settings(
     """导入配置（系统设置 + 邮箱账号及推送规则）。按邮箱匹配账号，存在则更新，不存在则创建。"""
     if body.settings:
         updates = body.settings.dict(exclude_unset=True)
-        for key in list(updates.keys()):
-            if key not in EDITABLE_KEYS:
-                del updates[key]
-        for key, value in updates.items():
-            if key in {"poll_interval_seconds", "retention_keep_days", "retention_keep_per_account"}:
-                val = str(value) if value is not None else ""
-            else:
-                val = (value or "").strip()
-            await db.execute(
-                text(
-                    "INSERT OR REPLACE INTO system_settings (key, value) VALUES (:k, :v)"
-                ),
-                {"k": key, "v": val},
-            )
+        await _persist_settings_updates(db, updates)
         await db.commit()
         set_db_overrides(await load_settings_from_db(db))
 
+    imported_count = 0
     if body.accounts:
         for idx, acc_in in enumerate(body.accounts):
             email = (acc_in.email or "").strip()
             if not email:
                 continue
+            port = int(acc_in.port or 993)
+            if not (1 <= port <= 65535):
+                port = 993
+            poll_interval = acc_in.poll_interval_seconds
+            if poll_interval is not None and poll_interval < 5:
+                poll_interval = 5
+            is_active = True if acc_in.is_active is None else bool(acc_in.is_active)
+            tg_enabled = True if acc_in.telegram_push_enabled is None else bool(acc_in.telegram_push_enabled)
+            sort_order = idx if acc_in.sort_order is None else int(acc_in.sort_order)
+
             existing = (
                 await db.execute(select(EmailAccount).where(EmailAccount.email == email))
             ).scalars().first()
             if existing:
                 existing.provider = acc_in.provider or "custom"
-                existing.host = acc_in.host or "imap.gmail.com"
-                existing.port = int(acc_in.port or 993)
-                existing.is_active = bool(acc_in.is_active)
-                existing.sort_order = int(acc_in.sort_order or idx)
-                existing.telegram_push_enabled = bool(acc_in.telegram_push_enabled)
+                existing.host = (acc_in.host or "imap.gmail.com").strip() or "imap.gmail.com"
+                existing.port = port
+                existing.is_active = is_active
+                existing.sort_order = sort_order
+                existing.telegram_push_enabled = tg_enabled
                 existing.push_template = acc_in.push_template or "short"
-                existing.poll_interval_seconds = acc_in.poll_interval_seconds
-                if acc_in.encrypted_pwd is not None and acc_in.encrypted_pwd != "":
+                existing.poll_interval_seconds = poll_interval
+                if acc_in.encrypted_pwd is not None and acc_in.encrypted_pwd.strip() != "":
                     existing.encrypted_pwd = acc_in.encrypted_pwd
                 account_id = existing.id
             else:
@@ -184,13 +224,13 @@ async def import_settings(
                 new_acc = EmailAccount(
                     email=email,
                     provider=acc_in.provider or "custom",
-                    host=acc_in.host or "imap.gmail.com",
-                    port=int(acc_in.port or 993),
-                    is_active=bool(acc_in.is_active),
-                    sort_order=int(acc_in.sort_order or idx),
-                    telegram_push_enabled=bool(acc_in.telegram_push_enabled),
+                    host=(acc_in.host or "imap.gmail.com").strip() or "imap.gmail.com",
+                    port=port,
+                    is_active=is_active,
+                    sort_order=sort_order,
+                    telegram_push_enabled=tg_enabled,
                     push_template=acc_in.push_template or "short",
-                    poll_interval_seconds=acc_in.poll_interval_seconds,
+                    poll_interval_seconds=poll_interval,
                     encrypted_pwd=enc_pwd,
                 )
                 db.add(new_acc)
@@ -199,14 +239,18 @@ async def import_settings(
 
             await db.execute(delete(TelegramFilterRule).where(TelegramFilterRule.account_id == account_id))
             for r in acc_in.telegram_rules or []:
+                val = (r.value or "").strip()
+                if not val:
+                    continue
                 rule = TelegramFilterRule(
                     account_id=account_id,
                     field=r.field if r.field in ("sender", "domain", "subject", "body") else "sender",
                     mode=r.mode if r.mode in ("allow", "deny") else "allow",
-                    value=(r.value or "").strip(),
+                    value=val,
                     rule_order=int(r.rule_order or 0),
                 )
                 db.add(rule)
+            imported_count += 1
         await db.commit()
 
     s = get_settings()
@@ -220,7 +264,7 @@ async def import_settings(
             "retention_keep_days": s.retention_keep_days,
             "retention_keep_per_account": s.retention_keep_per_account,
         },
-        "imported_accounts": len(body.accounts or []),
+        "imported_accounts": imported_count,
     }
 
 
@@ -231,20 +275,7 @@ async def update_settings(
 ) -> dict[str, Any]:
     """更新配置并写入 DB，立即生效（覆盖 .env）。"""
     updates = body.dict(exclude_unset=True)
-    for key in list(updates.keys()):
-        if key not in EDITABLE_KEYS:
-            del updates[key]
-    for key, value in updates.items():
-        if key in {"poll_interval_seconds", "retention_keep_days", "retention_keep_per_account"}:
-            val = str(value) if value is not None else ""
-        else:
-            val = (value or "").strip()
-        await db.execute(
-            text(
-                "INSERT OR REPLACE INTO system_settings (key, value) VALUES (:k, :v)"
-            ),
-            {"k": key, "v": val},
-        )
+    await _persist_settings_updates(db, updates)
     await db.commit()
     set_db_overrides(await load_settings_from_db(db))
     s = get_settings()
@@ -257,3 +288,4 @@ async def update_settings(
         "retention_keep_days": s.retention_keep_days,
         "retention_keep_per_account": s.retention_keep_per_account,
     }
+

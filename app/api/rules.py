@@ -76,6 +76,13 @@ async def update_rule(
     if payload.rule_order is not None:
         rule.rule_order = payload.rule_order
     if "account_id" in payload.dict(exclude_unset=True):
+        if payload.account_id is not None:
+            acc = await db.get(EmailAccount, payload.account_id)
+            if not acc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="account_id not found",
+                )
         rule.account_id = payload.account_id
     if payload.sender_pattern is not None:
         rule.sender_pattern = payload.sender_pattern.strip() or None
@@ -102,13 +109,14 @@ async def delete_rule(
     rule = await db.get(MailRule, rule_id)
     if not rule:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
-    # 删除规则时，同时清理该规则曾经打过的标签，避免历史邮件标签残留造成困扰。
+    # 删除规则时，清理该规则独有的标签（保留仍被其他规则使用的标签），并限定在规则适用账号范围内。
+    deleted_account_id = rule.account_id
     labels_to_remove: list[str] = []
     try:
         labels_to_remove = json.loads(rule.add_labels) if rule.add_labels else []
         if not isinstance(labels_to_remove, list):
             labels_to_remove = []
-        labels_to_remove = [str(x) for x in labels_to_remove if str(x).strip()]
+        labels_to_remove = [str(x).strip() for x in labels_to_remove if str(x).strip()]
     except Exception:
         labels_to_remove = []
 
@@ -118,10 +126,29 @@ async def delete_rule(
     if not labels_to_remove:
         return
 
-    res = await db.execute(select(EmailRecord))
+    # Exclude labels still referenced by any remaining rule.
+    rem_res = await db.execute(select(MailRule))
+    remaining_labels: set[str] = set()
+    for rem_rule in rem_res.scalars().all():
+        try:
+            rem_lbs = json.loads(rem_rule.add_labels) if rem_rule.add_labels else []
+            if isinstance(rem_lbs, list):
+                for lb in rem_lbs:
+                    if isinstance(lb, str) and lb.strip():
+                        remaining_labels.add(lb.strip())
+        except Exception:
+            continue
+
+    remove_set = set(labels_to_remove) - remaining_labels
+    if not remove_set:
+        return
+
+    stmt = select(EmailRecord)
+    if deleted_account_id is not None:
+        stmt = stmt.where(EmailRecord.account_id == deleted_account_id)
+    res = await db.execute(stmt)
     records = list(res.scalars().all())
     changed = 0
-    remove_set = set(labels_to_remove)
     for rec in records:
         if not rec.labels:
             continue
@@ -137,3 +164,4 @@ async def delete_rule(
             changed += 1
     if changed:
         await db.commit()
+

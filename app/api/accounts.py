@@ -1,13 +1,14 @@
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import func, select
-from app.core.auth import verify_api_token
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import verify_api_token
 from app.core.database import get_db
 from app.core.encryption import encrypt_secret
 from app.models.email import EmailAccount
+from app.models.mail_rule import MailRule
 from app.models.poll_status import AccountPollStatus
 from app.models.telegram_rule import TelegramFilterRule
 from app.schemas.accounts import (
@@ -34,7 +35,7 @@ async def list_accounts(
     result = await db.execute(
         select(EmailAccount).order_by(EmailAccount.sort_order, EmailAccount.id)
     )
-    return result.scalars().all()
+    return list(result.scalars().all())
 
 
 @router.get("/status", response_model=List[AccountPollStatusOut])
@@ -42,7 +43,7 @@ async def list_account_status(
     db: AsyncSession = Depends(get_db),
 ) -> list[AccountPollStatus]:
     result = await db.execute(select(AccountPollStatus))
-    return result.scalars().all()
+    return list(result.scalars().all())
 
 
 @router.post(
@@ -54,28 +55,34 @@ async def create_account(
     payload: EmailAccountCreate,
     db: AsyncSession = Depends(get_db),
 ) -> EmailAccount:
+    email_clean = str(payload.email).strip()
     exists = await db.execute(
-        select(EmailAccount).where(EmailAccount.email == payload.email)
+        select(EmailAccount).where(func.lower(EmailAccount.email) == email_clean.lower())
     )
     if exists.scalars().first():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email account already exists",
+            detail="该邮箱账号已存在",
         )
 
     normalized_pwd = (payload.app_password or "").strip().replace(" ", "")
+    if not normalized_pwd:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="邮箱授权码 / 应用密码不能为空",
+        )
     encrypted_pwd = encrypt_secret(normalized_pwd)
 
     # 新账号默认排在最后：当前最大 sort_order + 1
     max_q = await db.execute(select(func.max(EmailAccount.sort_order)))
-    max_sort = max_q.scalar_one() or 0
-    next_sort = int(max_sort) + 1
+    max_sort = max_q.scalar_one()
+    next_sort = 0 if max_sort is None else int(max_sort) + 1
 
     account = EmailAccount(
-        email=payload.email,
-        provider=getattr(payload, "provider", "custom"),
+        email=email_clean,
+        provider=getattr(payload, "provider", "custom") or "custom",
         encrypted_pwd=encrypted_pwd,
-        host=payload.host,
+        host=payload.host.strip(),
         port=payload.port,
         is_active=payload.is_active,
         sort_order=next_sort,
@@ -103,7 +110,7 @@ async def update_account(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
 
     if payload.host is not None:
-        account.host = payload.host
+        account.host = payload.host.strip()
     if payload.port is not None:
         account.port = payload.port
     if payload.is_active is not None:
@@ -120,6 +127,11 @@ async def update_account(
         account.poll_interval_seconds = payload.poll_interval_seconds
     if payload.app_password is not None:
         normalized_pwd = (payload.app_password or "").strip().replace(" ", "")
+        if not normalized_pwd:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="邮箱授权码 / 应用密码不能为空",
+            )
         account.encrypted_pwd = encrypt_secret(normalized_pwd)
 
     await db.commit()
@@ -142,6 +154,9 @@ async def delete_account(
     if not account:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
 
+    # Explicitly remove dependent rows without ORM relationships (belt-and-suspenders with ON DELETE CASCADE)
+    await db.execute(delete(AccountPollStatus).where(AccountPollStatus.account_id == account_id))
+    await db.execute(delete(MailRule).where(MailRule.account_id == account_id))
     await db.delete(account)
     await db.commit()
 
@@ -185,11 +200,14 @@ async def create_telegram_rule(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="field must be sender, domain, subject, or body")
     if payload.mode not in ("allow", "deny"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="mode must be allow or deny")
+    val = (payload.value or "").strip()
+    if not val:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="规则关键字不能为空")
     rule = TelegramFilterRule(
         account_id=account_id,
         field=payload.field,
         mode=payload.mode,
-        value=(payload.value or "").strip(),
+        value=val,
         rule_order=payload.rule_order,
     )
     db.add(rule)
@@ -219,7 +237,10 @@ async def update_telegram_rule(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="mode must be allow or deny")
         rule.mode = payload.mode
     if payload.value is not None:
-        rule.value = payload.value.strip()
+        val = payload.value.strip()
+        if not val:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="规则关键字不能为空")
+        rule.value = val
     if payload.rule_order is not None:
         rule.rule_order = payload.rule_order
     await db.commit()
@@ -240,4 +261,5 @@ async def delete_telegram_rule(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rule not found")
     await db.delete(rule)
     await db.commit()
+
 

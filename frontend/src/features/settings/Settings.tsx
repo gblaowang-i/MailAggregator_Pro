@@ -1,5 +1,6 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { apiClient, getApiToken, setApiToken } from "../../api/client";
+import axios from "axios";
+import { AuthConfig, apiClient, extractApiError, getApiToken, setApiToken } from "../../api/client";
 
 interface SettingsForm {
   telegram_bot_token: string;
@@ -22,9 +23,10 @@ export const Settings = () => {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState(false);
+  const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [consoleToken, setConsoleToken] = useState("");
   const [consoleSaved, setConsoleSaved] = useState(false);
+  const [loginEnabled, setLoginEnabled] = useState(false);
   const [changePwdCurrent, setChangePwdCurrent] = useState("");
   const [changePwdNew, setChangePwdNew] = useState("");
   const [changePwdConfirm, setChangePwdConfirm] = useState("");
@@ -37,10 +39,14 @@ export const Settings = () => {
     try {
       setLoading(true);
       setError(null);
-      const res = await apiClient.get<SettingsForm>("/settings");
+      const [res, authRes] = await Promise.all([
+        apiClient.get<SettingsForm>("/settings"),
+        axios.get<Partial<AuthConfig>>("/api/auth/config").catch(() => ({ data: {} as Partial<AuthConfig> }))
+      ]);
       setForm({ ...defaultForm, ...res.data });
-    } catch {
-      setError("加载设置失败");
+      setLoginEnabled(!!authRes.data?.login_required);
+    } catch (err) {
+      setError(extractApiError(err, "加载设置失败"));
     } finally {
       setLoading(false);
     }
@@ -56,32 +62,34 @@ export const Settings = () => {
     try {
       setSaving(true);
       setError(null);
-      setSuccess(false);
+      setSuccessMsg(null);
       await apiClient.patch("/settings", {
         telegram_bot_token: form.telegram_bot_token.trim() || null,
         telegram_chat_id: form.telegram_chat_id.trim() || null,
-        poll_interval_seconds: form.poll_interval_seconds,
+        poll_interval_seconds: Math.max(5, Number(form.poll_interval_seconds) || 300),
         webhook_url: form.webhook_url.trim() || null,
         api_token: form.api_token.trim() || null
       });
-      setSuccess(true);
-      setTimeout(() => setSuccess(false), 3000);
-    } catch {
-      setError("保存失败");
+      setSuccessMsg("已保存");
+      window.setTimeout(() => setSuccessMsg(null), 3000);
+    } catch (err) {
+      setError(extractApiError(err, "保存失败"));
     } finally {
       setSaving(false);
     }
   };
 
   const saveConsoleToken = () => {
-    setApiToken(consoleToken.trim() || null);
-    setConsoleToken(consoleToken.trim());
+    const trimmed = consoleToken.trim();
+    setApiToken(trimmed || null);
+    setConsoleToken(trimmed);
     setConsoleSaved(true);
-    setTimeout(() => setConsoleSaved(false), 2000);
+    window.setTimeout(() => setConsoleSaved(false), 2000);
   };
 
   const exportConfig = async () => {
     try {
+      setError(null);
       const res = await apiClient.get<Record<string, unknown>>("/settings/export");
       const blob = new Blob([JSON.stringify(res.data, null, 2)], {
         type: "application/json"
@@ -92,8 +100,8 @@ export const Settings = () => {
       a.download = "mail-tool-config.json";
       a.click();
       URL.revokeObjectURL(url);
-    } catch {
-      setError("导出失败");
+    } catch (err) {
+      setError(extractApiError(err, "导出失败"));
     }
   };
 
@@ -105,7 +113,7 @@ export const Settings = () => {
       setChangePwdError("两次输入的新密码不一致");
       return;
     }
-    if (changePwdNew.length < 6) {
+    if (changePwdNew.trim().length < 6) {
       setChangePwdError("新密码至少 6 位");
       return;
     }
@@ -119,10 +127,9 @@ export const Settings = () => {
       setChangePwdCurrent("");
       setChangePwdNew("");
       setChangePwdConfirm("");
-      setTimeout(() => setChangePwdSuccess(false), 3000);
-    } catch (err: unknown) {
-      const ax = err as { response?: { data?: { detail?: string } } };
-      setChangePwdError(typeof ax.response?.data?.detail === "string" ? ax.response.data.detail : "修改失败");
+      window.setTimeout(() => setChangePwdSuccess(false), 3000);
+    } catch (err) {
+      setChangePwdError(extractApiError(err, "修改失败"));
     } finally {
       setChangePwdLoading(false);
     }
@@ -137,19 +144,29 @@ export const Settings = () => {
       const data = JSON.parse(text) as Record<string, unknown>;
       if (!window.confirm("导入将覆盖当前配置与邮箱账号，是否继续？")) return;
       setError(null);
+      setSuccessMsg(null);
+      const settingsObj =
+        data.settings && typeof data.settings === "object"
+          ? (data.settings as Record<string, unknown>)
+          : data;
       if (Array.isArray(data.accounts)) {
-        await apiClient.post("/settings/import", {
-          settings: data.settings ?? data,
-          accounts: data.accounts
-        });
+        const res = await apiClient.post<{ imported_accounts?: number }>(
+          "/settings/import",
+          {
+            settings: settingsObj,
+            accounts: data.accounts
+          },
+          { timeout: 60000 }
+        );
+        setSuccessMsg(`导入成功（已同步 ${res.data?.imported_accounts ?? 0} 个账号）`);
       } else {
-        await apiClient.patch("/settings", data);
+        await apiClient.patch("/settings", settingsObj);
+        setSuccessMsg("导入设置成功");
       }
       await fetchSettings();
-      setSuccess(true);
-      setTimeout(() => setSuccess(false), 3000);
-    } catch {
-      setError("导入失败，请确认文件为有效 JSON 配置");
+      window.setTimeout(() => setSuccessMsg(null), 4000);
+    } catch (err) {
+      setError(extractApiError(err, "导入失败，请确认文件为有效 JSON 配置"));
     }
   };
 
@@ -163,59 +180,65 @@ export const Settings = () => {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
-      <section className="card">
-        <header className="card-header">
-          <div>
-            <h2>修改密码</h2>
-            <p className="card-subtitle">修改控制台登录密码（保存后立即生效）</p>
-          </div>
-        </header>
-        <form onSubmit={handleChangePassword} className="change-pwd-form">
-          {changePwdError && <p className="error-text">{changePwdError}</p>}
-          {changePwdSuccess && <p className="muted" style={{ color: "var(--success, #22c55e)", marginBottom: "0.5rem" }}>密码已修改</p>}
-          <div className="change-pwd-row">
-            <label className="field">
-              <span>当前密码</span>
-              <input
-                type="password"
-                autoComplete="current-password"
-                value={changePwdCurrent}
-                onChange={(e) => setChangePwdCurrent(e.target.value)}
-                required
-                disabled={changePwdLoading}
-              />
-            </label>
-            <label className="field">
-              <span>新密码</span>
-              <input
-                type="password"
-                autoComplete="new-password"
-                value={changePwdNew}
-                onChange={(e) => setChangePwdNew(e.target.value)}
-                required
-                disabled={changePwdLoading}
-                minLength={6}
-                placeholder="至少 6 位"
-              />
-            </label>
-            <label className="field">
-              <span>确认新密码</span>
-              <input
-                type="password"
-                autoComplete="new-password"
-                value={changePwdConfirm}
-                onChange={(e) => setChangePwdConfirm(e.target.value)}
-                required
-                disabled={changePwdLoading}
-                minLength={6}
-              />
-            </label>
-            <button type="submit" className="primary-btn" disabled={changePwdLoading}>
-              {changePwdLoading ? "提交中…" : "修改密码"}
-            </button>
-          </div>
-        </form>
-      </section>
+      {loginEnabled && (
+        <section className="card">
+          <header className="card-header">
+            <div>
+              <h2>修改密码</h2>
+              <p className="card-subtitle">修改控制台登录密码（保存后立即生效）</p>
+            </div>
+          </header>
+          <form onSubmit={handleChangePassword} className="change-pwd-form">
+            {changePwdError && <p className="error-text">{changePwdError}</p>}
+            {changePwdSuccess && (
+              <p className="success-text" style={{ marginBottom: "0.5rem" }}>
+                密码已修改
+              </p>
+            )}
+            <div className="change-pwd-row">
+              <label className="field">
+                <span>当前密码</span>
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  value={changePwdCurrent}
+                  onChange={(e) => setChangePwdCurrent(e.target.value)}
+                  required
+                  disabled={changePwdLoading}
+                />
+              </label>
+              <label className="field">
+                <span>新密码</span>
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  value={changePwdNew}
+                  onChange={(e) => setChangePwdNew(e.target.value)}
+                  required
+                  disabled={changePwdLoading}
+                  minLength={6}
+                  placeholder="至少 6 位"
+                />
+              </label>
+              <label className="field">
+                <span>确认新密码</span>
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  value={changePwdConfirm}
+                  onChange={(e) => setChangePwdConfirm(e.target.value)}
+                  required
+                  disabled={changePwdLoading}
+                  minLength={6}
+                />
+              </label>
+              <button type="submit" className="primary-btn" disabled={changePwdLoading}>
+                {changePwdLoading ? "提交中…" : "修改密码"}
+              </button>
+            </div>
+          </form>
+        </section>
+      )}
 
       <section className="card settings-page">
         <header className="card-header">
@@ -228,7 +251,7 @@ export const Settings = () => {
         </header>
 
         {error && <p className="error-text">{error}</p>}
-      {success && <p className="muted" style={{ color: "var(--success, #22c55e)" }}>已保存</p>}
+        {successMsg && <p className="success-text">{successMsg}</p>}
 
       <form onSubmit={handleSubmit} className="settings-form-h">
         <div className="settings-grid">
@@ -241,7 +264,7 @@ export const Settings = () => {
             <input
               type="password"
               autoComplete="off"
-              placeholder="留空则保持当前值"
+              placeholder="留空则关闭 Telegram 推送"
               value={form.telegram_bot_token}
               onChange={(e) => setForm((f) => ({ ...f, telegram_bot_token: e.target.value }))}
             />
@@ -265,7 +288,7 @@ export const Settings = () => {
             <input
               type="password"
               autoComplete="off"
-              placeholder="设置后，请求需带 Authorization: Bearer &lt;token&gt;；留空则关闭鉴权"
+              placeholder="设置后，请求需带 Authorization: Bearer <token>；留空则关闭鉴权"
               value={form.api_token}
               onChange={(e) => setForm((f) => ({ ...f, api_token: e.target.value }))}
             />
@@ -279,7 +302,7 @@ export const Settings = () => {
             <input
               type="text"
               autoComplete="off"
-              placeholder="留空则保持当前值"
+              placeholder="接收推送的 Telegram Chat ID，留空则关闭"
               value={form.telegram_chat_id}
               onChange={(e) => setForm((f) => ({ ...f, telegram_chat_id: e.target.value }))}
             />
@@ -357,3 +380,4 @@ export const Settings = () => {
     </div>
   );
 };
+

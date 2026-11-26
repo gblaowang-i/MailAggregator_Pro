@@ -1,8 +1,16 @@
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from pydantic import BaseModel, EmailStr, validator
+
+VALID_PUSH_TEMPLATES = frozenset({"full_email", "full", "short", "title_only"})
+
+
+def encode_utc_datetime(v: datetime) -> str:
+    if v.tzinfo is not None:
+        return v.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return v.isoformat() + "Z"
 
 
 class EmailAccountBase(BaseModel):
@@ -13,12 +21,38 @@ class EmailAccountBase(BaseModel):
     provider: str = "custom"
     sort_order: Optional[int] = None
     telegram_push_enabled: bool = True
-    push_template: str = "short"  # full | short | title_only
+    push_template: str = "short"  # full_email | full | short | title_only
     poll_interval_seconds: Optional[int] = None
 
 
 class EmailAccountCreate(EmailAccountBase):
     app_password: str
+
+    @validator("host")
+    def validate_host(cls, v: str) -> str:  # noqa: N805
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("IMAP Host 不能为空")
+        return v
+
+    @validator("port")
+    def validate_port(cls, v: int) -> int:  # noqa: N805
+        if not (1 <= v <= 65535):
+            raise ValueError("端口必须在 1 到 65535 之间")
+        return v
+
+    @validator("push_template")
+    def validate_push_template(cls, v: str) -> str:  # noqa: N805
+        v = (v or "short").strip()
+        if v not in VALID_PUSH_TEMPLATES:
+            raise ValueError("push_template 必须为 full_email、full、short 或 title_only")
+        return v
+
+    @validator("poll_interval_seconds")
+    def validate_poll_interval(cls, v: Optional[int]) -> Optional[int]:  # noqa: N805
+        if v is not None and v < 5:
+            raise ValueError("轮询间隔不能小于 5 秒")
+        return v
 
 
 class EmailAccountUpdate(BaseModel):
@@ -31,6 +65,36 @@ class EmailAccountUpdate(BaseModel):
     telegram_push_enabled: Optional[bool] = None
     push_template: Optional[str] = None
     poll_interval_seconds: Optional[int] = None
+
+    @validator("host")
+    def validate_host(cls, v: Optional[str]) -> Optional[str]:  # noqa: N805
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            raise ValueError("IMAP Host 不能为空")
+        return v
+
+    @validator("port")
+    def validate_port(cls, v: Optional[int]) -> Optional[int]:  # noqa: N805
+        if v is not None and not (1 <= v <= 65535):
+            raise ValueError("端口必须在 1 到 65535 之间")
+        return v
+
+    @validator("push_template")
+    def validate_push_template(cls, v: Optional[str]) -> Optional[str]:  # noqa: N805
+        if v is None:
+            return None
+        v = v.strip()
+        if v not in VALID_PUSH_TEMPLATES:
+            raise ValueError("push_template 必须为 full_email、full、short 或 title_only")
+        return v
+
+    @validator("poll_interval_seconds")
+    def validate_poll_interval(cls, v: Optional[int]) -> Optional[int]:  # noqa: N805
+        if v is not None and v < 5:
+            raise ValueError("轮询间隔不能小于 5 秒")
+        return v
 
 
 class EmailAccountOut(EmailAccountBase):
@@ -54,6 +118,7 @@ class EmailRecordOut(BaseModel):
 
     class Config:
         orm_mode = True
+        json_encoders = {datetime: encode_utc_datetime}
 
     @validator("labels", pre=True)
     def parse_labels(cls, v):  # noqa: N805
@@ -69,12 +134,19 @@ class EmailRecordDetailOut(EmailRecordOut):
     body_text: Optional[str] = None
     body_html: Optional[str] = None
 
+    class Config:
+        orm_mode = True
+        json_encoders = {datetime: encode_utc_datetime}
+
 
 class EmailListOut(BaseModel):
     items: List[EmailRecordOut]
     total: int
     page: int
     page_size: int
+
+    class Config:
+        json_encoders = {datetime: encode_utc_datetime}
 
 
 class AccountPollStatusOut(BaseModel):
@@ -86,6 +158,7 @@ class AccountPollStatusOut(BaseModel):
 
     class Config:
         orm_mode = True
+        json_encoders = {datetime: encode_utc_datetime}
 
 
 class TelegramFilterRuleCreate(BaseModel):

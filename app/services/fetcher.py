@@ -5,7 +5,7 @@ import json
 
 from anyio import to_thread
 from bs4 import BeautifulSoup
-from imap_tools import AND, MailBox
+from imap_tools import AND, MailBox, MailBoxUnencrypted
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,17 +17,101 @@ from app.services.rules_engine import apply_mail_rules
 from app.services.telegram import send_email_notification, should_push_telegram
 from app.services.webhook import send_webhook_for_email
 
+IMAP_SOCKET_TIMEOUT_SEC = 30
+IMAP_FETCH_TIMEOUT_SEC = 120
+DB_BATCH_QUERY_SIZE = 500
+
+# Per-account lock to prevent concurrent poller + manual fetch_once races.
+_account_locks: dict[int, asyncio.Lock] = {}
+
+
+def _get_account_lock(account_id: int) -> asyncio.Lock:
+    lock = _account_locks.get(account_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _account_locks[account_id] = lock
+    return lock
+
+
+def _to_naive_utc(dt: datetime | None) -> datetime:
+    """Normalize any datetime (aware or naive) to naive UTC for consistent storage & sorting."""
+    if dt is None:
+        return datetime.utcnow()
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _extract_rfc_message_id(msg: object) -> str:
+    msg_id = getattr(msg, "message_id", None)
+    if isinstance(msg_id, str) and msg_id.strip():
+        return msg_id.strip()
+
+    headers = getattr(msg, "headers", None)
+    if isinstance(headers, dict):
+        for k, val in headers.items():
+            if str(k).lower() == "message-id":
+                if isinstance(val, (tuple, list)):
+                    for item in val:
+                        if isinstance(item, str) and item.strip():
+                            return item.strip()
+                elif isinstance(val, str) and val.strip():
+                    return val.strip()
+    return ""
+
+
+def _extract_message_id(msg: object, account_id: int) -> tuple[str, str]:
+    """
+    Return (primary_message_id, legacy_rfc_message_id).
+
+    Using account-scoped UID (`{account_id}:{uid}`) preserves full backward compatibility
+    with existing SQLite rows produced by imap_tools (where headers['message-id'] is a tuple)
+    and guarantees two accounts receiving the same email never collide on the UNIQUE constraint.
+    """
+    rfc_id = _extract_rfc_message_id(msg)
+    uid = getattr(msg, "uid", None)
+    if uid:
+        return f"{account_id}:{uid}", rfc_id
+    if rfc_id:
+        return f"{account_id}:{rfc_id}", rfc_id
+    return "", ""
+
+
+def _to_plain_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(separator="\n")
+    lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+    return "\n".join(lines)
+
 
 async def fetch_recent_emails_for_account(
     db: AsyncSession,
     account_id: int,
     lookback_hours: int = 24,
+    allow_inactive: bool = False,
+) -> int:
+    lock = _get_account_lock(account_id)
+    async with lock:
+        return await _fetch_recent_emails_locked(
+            db,
+            account_id=account_id,
+            lookback_hours=lookback_hours,
+            allow_inactive=allow_inactive,
+        )
+
+
+async def _fetch_recent_emails_locked(
+    db: AsyncSession,
+    account_id: int,
+    lookback_hours: int = 24,
+    allow_inactive: bool = False,
 ) -> int:
     result = await db.execute(
         select(EmailAccount).where(EmailAccount.id == account_id)
     )
     account = result.scalars().first()
-    if not account or not account.is_active:
+    if not account or (not allow_inactive and not account.is_active):
         return 0
 
     print(f"[telegram] fetch_start account_id={account_id}")
@@ -50,64 +134,77 @@ async def fetch_recent_emails_for_account(
         max_messages = 200
 
     password = decrypt_secret(account.encrypted_pwd)
+    port = int(account.port or 993)
 
-    def _extract_message_id(msg: object, account_id: int) -> str:
-        # imap_tools message objects vary by version; prefer RFC Message-ID header.
-        msg_id = getattr(msg, "message_id", None)
-        if isinstance(msg_id, str) and msg_id.strip():
-            return msg_id.strip()
-
-        headers = getattr(msg, "headers", None)
-        if isinstance(headers, dict):
-            hdr = headers.get("message-id") or headers.get("Message-ID") or headers.get("Message-Id")
-            if isinstance(hdr, str) and hdr.strip():
-                return hdr.strip()
-
-        uid = getattr(msg, "uid", None)
-        if uid:
-            return f"{account_id}:{uid}"
-        return ""
-
-    def _to_plain_text(html: str) -> str:
-        soup = BeautifulSoup(html, "html.parser")
-        text = soup.get_text(separator="\n")
-        # Basic cleanup
-        lines = [ln.strip() for ln in text.splitlines()]
-        lines = [ln for ln in lines if ln]
-        return "\n".join(lines)
-
-    def _fetch_sync() -> list[tuple[str, str, str, datetime, str, str]]:
-        items: list[tuple[str, str, str, datetime, str, str]] = []
-        with MailBox(account.host).login(account.email, password, "INBOX") as mbox:
+    def _fetch_sync() -> list[tuple[str, str, str, str, datetime, str, str]]:
+        items: list[tuple[str, str, str, str, datetime, str, str]] = []
+        mailbox_cls = MailBoxUnencrypted if port == 143 else MailBox
+        with mailbox_cls(
+            account.host,
+            port=port,
+            timeout=IMAP_SOCKET_TIMEOUT_SEC,
+        ).login(account.email, password, "INBOX") as mbox:
             for msg in mbox.fetch(
                 AND(date_gte=since_dt.date()),
                 reverse=True,
                 limit=max_messages,
             ):
-                message_id = _extract_message_id(msg, account.id)
+                message_id, legacy_rfc_id = _extract_message_id(msg, account.id)
                 if not message_id:
                     continue
                 subject = msg.subject or ""
                 sender = msg.from_ or ""
-                received_at = msg.date or datetime.utcnow()
+                received_at = _to_naive_utc(getattr(msg, "date", None))
                 html = getattr(msg, "html", None) or ""
                 text = getattr(msg, "text", None) or ""
                 if not text and html:
                     text = _to_plain_text(html)
-                items.append((message_id, subject, sender, received_at, text, html))
+                items.append((message_id, legacy_rfc_id, subject, sender, received_at, text, html))
         return items
 
-    fetched = await to_thread.run_sync(_fetch_sync)
+    try:
+        fetched = await asyncio.wait_for(
+            to_thread.run_sync(_fetch_sync),
+            timeout=IMAP_FETCH_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(f"IMAP 连接或拉取超时（>{IMAP_FETCH_TIMEOUT_SEC}s）") from exc
+
+    # Batch-fetch existing EmailRecords by message_id to avoid N+1 SQL queries.
+    candidate_ids: set[str] = set()
+    for message_id, legacy_rfc_id, *_ in fetched:
+        candidate_ids.add(message_id)
+        if legacy_rfc_id:
+            candidate_ids.add(legacy_rfc_id)
+
+    existing_by_mid: dict[str, EmailRecord] = {}
+    candidate_list = list(candidate_ids)
+    for i in range(0, len(candidate_list), DB_BATCH_QUERY_SIZE):
+        chunk = candidate_list[i : i + DB_BATCH_QUERY_SIZE]
+        q = await db.execute(select(EmailRecord).where(EmailRecord.message_id.in_(chunk)))
+        for rec in q.scalars().all():
+            existing_by_mid[rec.message_id] = rec
+
+    mail_rules_result = await db.execute(
+        select(MailRule).order_by(MailRule.rule_order, MailRule.id)
+    )
+    mail_rules = list(mail_rules_result.scalars().all())
 
     inserted = 0
     updated = 0
-    new_records: list[tuple[EmailRecord, str]] = []
+    seen_in_batch: set[str] = set()
+    new_entries: list[tuple[EmailRecord, bool]] = []
 
-    for message_id, subject, sender, received_at, body_text, body_html in fetched:
-        existing_q = await db.execute(
-            select(EmailRecord).where(EmailRecord.message_id == message_id)
-        )
-        existing = existing_q.scalars().first()
+    for message_id, legacy_rfc_id, subject, sender, received_at, body_text, body_html in fetched:
+        if message_id in seen_in_batch:
+            continue
+        seen_in_batch.add(message_id)
+
+        existing = existing_by_mid.get(message_id)
+        if existing is None and legacy_rfc_id:
+            legacy_rec = existing_by_mid.get(legacy_rfc_id)
+            if legacy_rec is not None and legacy_rec.account_id == account.id:
+                existing = legacy_rec
 
         # If already exists, backfill body fields when missing.
         if existing:
@@ -139,37 +236,19 @@ async def fetch_recent_emails_for_account(
             received_at=received_at,
             created_at=datetime.utcnow(),
         )
-        db.add(record)
-        new_records.append((record, body_text or ""))
-
-    await db.commit()
-
-    mail_rules_result = await db.execute(
-        select(MailRule).order_by(MailRule.rule_order, MailRule.id)
-    )
-    mail_rules = list(mail_rules_result.scalars().all())
-
-    skip_telegram_by_id: dict[int, bool] = {}
-    for record, body_text in new_records:
         labels_to_add, skip_telegram, mark_read = apply_mail_rules(
-            record, body_text, mail_rules
+            record, body_text or "", mail_rules
         )
-        skip_telegram_by_id[record.id] = skip_telegram
-        existing = []
-        if record.labels:
-            try:
-                existing = json.loads(record.labels) if record.labels.strip() else []
-            except Exception:
-                pass
-        seen = set(existing)
-        for lb in labels_to_add:
-            if lb not in seen:
-                existing.append(lb)
-                seen.add(lb)
-        record.labels = json.dumps(existing, ensure_ascii=False)
+        if labels_to_add:
+            record.labels = json.dumps(labels_to_add, ensure_ascii=False)
         if mark_read:
             record.is_read = True
-    if new_records:
+
+        db.add(record)
+        inserted += 1
+        new_entries.append((record, skip_telegram))
+
+    if inserted or updated:
         await db.commit()
 
     telegram_rules_result = await db.execute(
@@ -179,59 +258,51 @@ async def fetch_recent_emails_for_account(
     )
     telegram_rules = list(telegram_rules_result.scalars().all())
 
-    # 初次同步仅入库不推送；非初次时 new_records 仅含本轮新插入的邮件，再叠加“最近 N 小时内”才推送，避免轰炸。
+    # 初次同步仅入库不推送；非初次时 new_entries 仅含本轮新插入的邮件，再叠加“最近 N 小时内”才推送，避免轰炸。
     PUSH_RECENCY_HOURS = 12
     recency_threshold = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=PUSH_RECENCY_HOURS)
-
-    def _received_at_naive_utc(dt: datetime | None) -> datetime | None:
-        """归一化为 naive UTC，避免与 recency_threshold 比较时 offset-naive vs offset-aware 报错。"""
-        if dt is None:
-            return None
-        if dt.tzinfo is not None:
-            return dt.astimezone(timezone.utc).replace(tzinfo=None)
-        return dt
 
     TELEGRAM_PUSH_DELAY_SEC = 1.5
     MAX_PUSH_PER_ACCOUNT_PER_RUN = 30
 
     # 每次拉取都打一行，便于确认是否走到推送逻辑（若无新邮件则 new_records=0，不会推送）
-    print(f"[telegram] account_id={account.id} is_initial_sync={is_initial_sync} new_records={len(new_records)}")
+    print(f"[telegram] account_id={account.id} is_initial_sync={is_initial_sync} new_records={len(new_entries)}")
 
     if not is_initial_sync:
         pushed_count = 0
         recency_skipped = 0
-        push_error: str | None = None
-        try:
-            for record, _ in new_records:
-                r_at = _received_at_naive_utc(record.received_at)
-                if r_at is not None and r_at < recency_threshold:
-                    recency_skipped += 1
-                    await send_webhook_for_email(record, account.email)
-                    continue
-                if pushed_count >= MAX_PUSH_PER_ACCOUNT_PER_RUN:
-                    await send_webhook_for_email(record, account.email)
-                    continue
-                skip_from_mail = skip_telegram_by_id.get(record.id, False)
-                if should_push_telegram(
-                    record, account, telegram_rules, skip_from_mail
-                ):
+        push_errors = 0
+        for record, skip_from_mail in new_entries:
+            r_at = _to_naive_utc(record.received_at) if record.received_at is not None else None
+            if r_at is not None and r_at < recency_threshold:
+                recency_skipped += 1
+                await send_webhook_for_email(record, account.email)
+                continue
+            if pushed_count >= MAX_PUSH_PER_ACCOUNT_PER_RUN:
+                await send_webhook_for_email(record, account.email)
+                continue
+            if should_push_telegram(
+                record, account, telegram_rules, skip_from_mail
+            ):
+                try:
                     await send_email_notification(record, account)
                     pushed_count += 1
                     if pushed_count < MAX_PUSH_PER_ACCOUNT_PER_RUN:
                         await asyncio.sleep(TELEGRAM_PUSH_DELAY_SEC)
-                await send_webhook_for_email(record, account.email)
-        except Exception as exc:  # noqa: BLE001
-            push_error = str(exc)
-            print(f"[telegram] account_id={account.id} push_error: {exc}")
-        if new_records:
+                except Exception as exc:  # noqa: BLE001
+                    push_errors += 1
+                    print(f"[telegram] account_id={account.id} push_error: {exc}")
+            await send_webhook_for_email(record, account.email)
+        if new_entries:
             hint = f" (超过{PUSH_RECENCY_HOURS}h未推送)" if recency_skipped else ""
-            err_hint = f" error={push_error}" if push_error else ""
+            err_hint = f" errors={push_errors}" if push_errors else ""
             print(
-                f"[telegram] account_id={account.id} new_emails={len(new_records)} "
+                f"[telegram] account_id={account.id} new_emails={len(new_entries)} "
                 f"recency_skipped={recency_skipped} pushed={pushed_count}{hint}{err_hint}"
             )
-    elif new_records:
-        print(f"[telegram] account_id={account.id} initial_sync new_emails={len(new_records)} (no push)")
+    elif new_entries:
+        print(f"[telegram] account_id={account.id} initial_sync new_emails={len(new_entries)} (no push)")
 
     return inserted + updated
+
 

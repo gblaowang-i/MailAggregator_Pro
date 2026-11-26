@@ -18,8 +18,13 @@ build/
 
 # 数据库与数据文件
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
+data/
+.encryption_key
+
 
 # 前端
 frontend/node_modules/

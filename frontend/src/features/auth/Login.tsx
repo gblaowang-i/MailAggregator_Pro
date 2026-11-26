@@ -1,35 +1,52 @@
 import { FormEvent, useEffect, useState } from "react";
 import axios from "axios";
-import { setApiToken } from "../../api/client";
+import { AuthConfig, setApiToken } from "../../api/client";
 
 const AUTH_CONFIG_URL = "/api/auth/config";
 const LOGIN_URL = "/api/auth/login";
+const ME_URL = "/api/auth/me";
 const RESET_PASSWORD_URL = "/api/auth/reset-password";
 
 export interface LoginProps {
   onSuccess: () => void;
   theme?: "dark" | "light";
   onToggleTheme?: () => void;
+  authConfig?: AuthConfig;
 }
 
-type AuthView = "login" | "reset";
+type AuthView = "login" | "token" | "reset";
 
-export const Login = ({ onSuccess, theme = "dark", onToggleTheme }: LoginProps) => {
-  const [view, setView] = useState<AuthView>("login");
+export const Login = ({ onSuccess, theme = "dark", onToggleTheme, authConfig }: LoginProps) => {
+  const [loginEnabled, setLoginEnabled] = useState<boolean>(authConfig?.login_required ?? true);
+  const [tokenEnabled, setTokenEnabled] = useState<boolean>(authConfig?.api_token_required ?? false);
+  const [resetAvailable, setResetAvailable] = useState<boolean>(authConfig?.reset_available ?? false);
+  const [view, setView] = useState<AuthView>(
+    authConfig && !authConfig.login_required && authConfig.api_token_required ? "token" : "login"
+  );
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [apiTokenInput, setApiTokenInput] = useState("");
   const [resetToken, setResetToken] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [newPasswordConfirm, setNewPasswordConfirm] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [resetAvailable, setResetAvailable] = useState(false);
 
   useEffect(() => {
-    axios.get<{ reset_available?: boolean }>(AUTH_CONFIG_URL).then((res) => {
-      setResetAvailable(!!res.data?.reset_available);
-    }).catch(() => {});
+    axios
+      .get<Partial<AuthConfig>>(AUTH_CONFIG_URL)
+      .then((res) => {
+        const loginReq = !!res.data?.login_required;
+        const tokenReq = !!res.data?.api_token_required;
+        setLoginEnabled(loginReq);
+        setTokenEnabled(tokenReq);
+        setResetAvailable(!!res.data?.reset_available);
+        if (!loginReq && tokenReq) {
+          setView("token");
+        }
+      })
+      .catch(() => {});
   }, []);
 
   const handleLogin = async (e: FormEvent) => {
@@ -58,6 +75,29 @@ export const Login = ({ onSuccess, theme = "dark", onToggleTheme }: LoginProps) 
     }
   };
 
+  const handleTokenLogin = async (e: FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setSuccess(null);
+    const trimmed = apiTokenInput.trim();
+    if (!trimmed) {
+      setError("请输入 API Token");
+      return;
+    }
+    setLoading(true);
+    try {
+      await axios.get(ME_URL, {
+        headers: { Authorization: `Bearer ${trimmed}` }
+      });
+      setApiToken(trimmed);
+      onSuccess();
+    } catch {
+      setError("API Token 无效，请核对后重试");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleReset = async (e: FormEvent) => {
     e.preventDefault();
     setError(null);
@@ -80,7 +120,7 @@ export const Login = ({ onSuccess, theme = "dark", onToggleTheme }: LoginProps) 
       setResetToken("");
       setNewPassword("");
       setNewPasswordConfirm("");
-      setTimeout(() => {
+      window.setTimeout(() => {
         setView("login");
         setSuccess(null);
       }, 2000);
@@ -167,14 +207,58 @@ export const Login = ({ onSuccess, theme = "dark", onToggleTheme }: LoginProps) 
                 <button type="submit" className="auth-submit" disabled={loading}>
                   {loading ? "登录中…" : "登录"}
                 </button>
-                {resetAvailable && (
-                  <p className="auth-links">
+                <div className="auth-links" style={{ display: "flex", flexDirection: "column", gap: "0.45rem" }}>
+                  {resetAvailable && (
                     <button
                       type="button"
                       className="auth-link"
                       onClick={() => { setView("reset"); setError(null); setSuccess(null); }}
                     >
                       忘记密码？使用重置令牌
+                    </button>
+                  )}
+                  {tokenEnabled && (
+                    <button
+                      type="button"
+                      className="auth-link"
+                      onClick={() => { setView("token"); setError(null); setSuccess(null); }}
+                    >
+                      改用 API Token 认证
+                    </button>
+                  )}
+                </div>
+              </form>
+            </>
+          ) : view === "token" ? (
+            <>
+              <h2>API Token 认证</h2>
+              <p className="auth-subtitle">服务端已启用 API_TOKEN 鉴权，请输入配置的 Token</p>
+              <form className="auth-form" onSubmit={handleTokenLogin}>
+                <div className="auth-field">
+                  <label htmlFor="api-token-input">API Token</label>
+                  <input
+                    id="api-token-input"
+                    type="password"
+                    value={apiTokenInput}
+                    onChange={(e) => setApiTokenInput(e.target.value)}
+                    autoComplete="off"
+                    required
+                    disabled={loading}
+                    placeholder="输入后端配置的 API_TOKEN"
+                  />
+                </div>
+                {error && <p className="auth-error">{error}</p>}
+                <button type="submit" className="auth-submit" disabled={loading}>
+                  {loading ? "验证中…" : "进入控制台"}
+                </button>
+                {loginEnabled && (
+                  <p className="auth-links">
+                    <button
+                      type="button"
+                      className="auth-link"
+                      onClick={() => { setView("login"); setError(null); setSuccess(null); }}
+                    >
+                      改用管理员账号登录
                     </button>
                   </p>
                 )}
@@ -248,3 +332,4 @@ export const Login = ({ onSuccess, theme = "dark", onToggleTheme }: LoginProps) 
     </div>
   );
 };
+
